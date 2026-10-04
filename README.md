@@ -1,66 +1,22 @@
-# How to Disable Deskflow Client/Server DPMS and XSetScreenSaver API calls
+# deskflow-disable-dpms
 
-The problem with `deskflow-core` is that it messes up my DPMS config
-and my screensaver settings. This project is an `LD_PRELOAD` patch that
-stubs out every screen saver and DPMS function call Deskflow makes.
+`LD_PRELOAD` shim that stops Deskflow from touching the X11 screen saver
+and DPMS settings. Deskflow's `XWindowsScreenSaver` reads the current
+`xset` state at startup and rewrites it on connect/disconnect and on
+shutdown. This library stubs those calls so `xset -dpms` / `xset s off`
+survive.
 
-It is a port of the original Barrier
+Port of the original
 [barrier-disable-dpms](https://github.com/cookiengineer/barrier-disable-dpms)
-hack. The behavior is identical: Deskflow's `XWindowsScreenSaver` rewrites
-the X11 screen saver and DPMS state behind your back.
+hack.
 
-## Motivation
+## What Deskflow Calls
 
-I am using `i3` and a separate `autostart.conf` file to use the
-`exec --no-startup-id` calls to have autostart functionality
-which starts all programs after I've been logged in. In order to
-prevent my monitors from blanking out or powering off when I'm
-not active or watching a video, I'm specifically disabling
-DPMS and the screensaver via `xset`.
-
-```bash
-# disable all dpms settings
-exec --no-startup-id xset dpms 0 0 0
-exec --no-startup-id xset -dpms
-
-# screensaver after 15 minutes
-exec --no-startup-id xset s 900 900
-
-# disable screensaver
-exec --no-startup-id xset s off
-```
-
-## The Problem
-
-However, Deskflow as a program is too stupid to realize that when
-I move my mouse on my host system that I actually want to continue
-to use my other system's connected monitors without them flickering
-every couple minutes like a damn epilepsy inducing art installation.
-
-There used to be a setting to disable this behavior, but the
-maintainers removed it.
-
-## Tracing The Culprit
-
-I was almost losing my mind trying to figure out where the `xset`
-calls come from. I've built a little helper program for that in the
-[tracer](/tracer/main.go) folder.
-
-Usage of that program is simple, for example to intercept `xset`
-binary execution calls:
-
-- Rename the original `/usr/bin/xset` to `/usr/bin/xset.real`
-- Copy the built `/tracer/main` to `/usr/bin/xset`
-- Use `watch cat /tmp/xset.log` to get parent and process info
-
-Turns out, `xset` was not called from anywhere. The culprit was
-`deskflow-core` executing the calls directly via the X11 API instead
-of relying on `xset` for that. On Linux the relevant implementation is
-`XWindowsScreenSaver` in
+On Linux the offender is `XWindowsScreenSaver` in
 [`src/lib/platform/XWindowsScreenSaver.cpp`](https://github.com/deskflow/deskflow/blob/v1.26.0/src/lib/platform/XWindowsScreenSaver.cpp):
 
 ```bash
-> nm -D --undefined-only /usr/bin/deskflow-core | grep -E 'DPMS|ScreenSaver'
+$ nm -D --undefined-only /usr/bin/deskflow-core | grep -E 'DPMS|ScreenSaver'
                  U DPMSCapable
                  U DPMSDisable
                  U DPMSEnable
@@ -72,104 +28,95 @@ of relying on `xset` for that. On Linux the relevant implementation is
                  U XSetScreenSaver
 ```
 
-Note: `deskflow` (the Qt GUI) only launches `deskflow-core`, so the
-preload only needs to reach the `deskflow-core` process.
+The binary is a normal dynamically linked PIE (not setuid, no
+capabilities) that resolves these through its GOT, so a preloaded object
+wins symbol lookup. The Qt GUI (`deskflow`) only launches the core
+process, so only that process needs the preload.
 
-## Stubbing DPMS and XSet Function Calls
+## How The Shim Works
 
-Remember the old [CVE-2009-0641](https://nvd.nist.gov/vuln/detail/CVE-2009-0641)
-that showed a technique to implement privilege escalation for binaries
-that don't drop their rights directly to `nobody` after they've done
-something via `setuid(0)`?
+- `DPMSQueryExtension()` and `DPMSCapable()` return `0`. Deskflow then
+  keeps `m_dpms == false` and never calls any other DPMS entry point. The
+  remaining DPMS calls are stubbed anyway, as defense in depth.
+- `XSetScreenSaver()` and `XForceScreenSaver()` are no-ops.
+- `XGetScreenSaver()` is intentionally passed through (read-only).
+- The remaining hooks (`XSetSelectionOwner`, `XSetErrorHandler`,
+  `XSetIOErrorHandler`, `XSetICFocus`, `XSetInputFocus`) pass through and
+  exist only for tracing.
 
-Well, that technique allows to override pretty much all shared library
-symbols. And that's what we're going to do, so that `deskflow-core`
-only does nothing when it tries to mess with our DPMS and Screen Saver
-settings.
+See [`x11hook/hook.c`](/x11hook/hook.c).
 
-`deskflow-core` is a normal dynamically linked PIE (not setuid, no
-capabilities) that resolves these symbols through its GOT
-(`-fno-plt` / `R_X86_64_GLOB_DAT`), so a preloaded library wins the
-symbol lookup.
+## Behavior Notes
 
-## x11hooks.so Function Call Blocker
+These are the non-obvious behaviors that make the patch look flaky.
 
-So our little [hook.c](/x11hook/hook.c) library does nothing more
-than to return the expected signature, and to do nothing, essentially
-stubbing the API.
+1. **`LD_PRELOAD` is per process and per machine.** It only wraps
+   processes started with it set. The server and client are separate
+   processes (often on separate machines); each needs the shim. Patching
+   the client does not affect the server.
 
-The most important trick is to make `DPMSQueryExtension()` and
-`DPMSCapable()` return `0`. Deskflow then keeps `m_dpms == false` and
-never calls any other DPMS function in the first place. The remaining
-DPMS calls are stubbed anyway as defense-in-depth:
+2. **Deskflow restores its captured state when it terminates.** At startup
+   `XWindowsScreenSaver` records `m_timeout`, blanking settings, and DPMS
+   enablement. Its destructor writes them back:
 
-```c
-Bool DPMSQueryExtension(Display *dpy, int *event_base, int *error_base) {
-    log_call("DPMSQueryExtension (BLOCKED)");
-    if (event_base) *event_base = 0;
-    if (error_base) *error_base = 0;
-    return 0; // pretend DPMS is unavailable
-}
-```
+   ```cpp
+   XWindowsScreenSaver::~XWindowsScreenSaver() {
+     enableDPMS(m_dpmsEnabled);
+     XSetScreenSaver(m_display, m_timeout, m_interval, m_preferBlanking, m_allowExposures);
+     ...
+   }
+   ```
 
-The built-in X screen saver is blocked via `XSetScreenSaver()` and
-`XForceScreenSaver()`:
+   So `systemctl --user stop/restart` re-applies the **startup** values
+   *while the old process is terminating*. With the shim loaded those
+   calls are `(BLOCKED)` and nothing changes. A hard `SIGKILL` skips the
+   handler as well, but systemd uses `SIGTERM`.
 
-```c
-int XSetScreenSaver(Display *dpy, int timeout, int interval,
-                    int prefer_blanking, int allow_exposures) {
-    log_call("XSetScreenSaver (BLOCKED)");
-    return 0;
-}
+3. **A running process cannot be protected retroactively.** If the
+   process shutting down was started before the shim was in place, its
+   termination handler uses the real X11 calls and resets the settings.
+   That is a one-time event. After editing the unit, run `systemctl
+   --user daemon-reload`; the next restart replaces the old process with
+   a hooked one, and every restart after that is clean.
 
-int XForceScreenSaver(Display *dpy, int mode) {
-    log_call("XForceScreenSaver (BLOCKED)");
-    return 1;
-}
-```
+| process state | `xset` at start | you run `xset -dpms; xset s off` | then `systemctl --user stop/restart` |
+|---|---|---|---|
+| no `LD_PRELOAD` | 600 / enabled | off | **reset to 600 / enabled** |
+| `LD_PRELOAD` | 600 / enabled | off | stays off (calls blocked) |
 
-## Building
-
-Build both the hook and the tracer from the project root:
+## Build
 
 ```bash
 make          # builds x11hook/x11hook.so and tracer/main
 make clean    # removes the build artifacts
 ```
 
-## Installation
-
-The [install.sh](/x11hook/install.sh) script detects Arch Linux
-(`pacman`) and Debian/Ubuntu (`apt`), builds `x11hook.so`, installs it
-as `/usr/local/lib/deskflow-disable-dpms.so`, and writes a systemd user
-drop-in for the deskflow service:
+## Install
 
 ```bash
-> ./install.sh
-# or, if your service is named differently:
-> ./install.sh deskflow-client.service
+./x11hook/install.sh deskflow-client.service   # or deskflow-server.service
 ```
 
-This creates
-`~/.config/systemd/user/deskflow-server.service.d/disable-dpms.conf`:
+This detects Arch (`pacman`) / Debian (`apt`), builds `x11hook.so`,
+installs it as `/usr/local/lib/deskflow-disable-dpms.so`, and writes a
+systemd user drop-in at
+`~/.config/systemd/user/<service>.d/disable-dpms.conf`:
 
 ```ini
 [Service]
 Environment=LD_PRELOAD=/usr/local/lib/deskflow-disable-dpms.so
 ```
 
-Then apply it:
+Apply it:
 
 ```bash
 systemctl --user daemon-reload
-systemctl --user restart deskflow-server.service
+systemctl --user restart deskflow-client.service
 ```
 
-## Manual Usage
+## Manual / GUI Use
 
-If you launch the GUI instead of the service, export the preload
-before starting it. The GUI passes its environment on to the
-`deskflow-core` child process:
+The GUI passes its environment to the core child process:
 
 ```bash
 env LD_PRELOAD=/usr/local/lib/deskflow-disable-dpms.so deskflow
@@ -182,30 +129,44 @@ env LD_PRELOAD=/usr/local/lib/deskflow-disable-dpms.so \
     deskflow-core server --settings ~/.config/Deskflow/deskflow-server.conf
 ```
 
-## Debugging
+## Verify
 
-Logging is opt-in and silent by default so the hot input paths
-(`XSetInputFocus`, `XSetICFocus`) don't spam `/tmp`. Set
-`X11HOOK_LOG=1` to log every intercepted call to `/tmp/x11-hook.log`:
+Confirm a running process actually has the shim:
+
+```bash
+p=$(systemctl --user show -p MainPID --value deskflow-client.service)
+tr '\0' '\n' < /proc/$p/environ | grep LD_PRELOAD
+grep deskflow-disable-dpms /proc/$p/maps
+```
+
+Enable logging to watch intercepted calls:
 
 ```bash
 X11HOOK_LOG=1 LD_PRELOAD=/usr/local/lib/deskflow-disable-dpms.so \
     deskflow-core server --settings ~/.config/Deskflow/deskflow-server.conf
+# log: /tmp/x11-hook.log
 ```
 
-## Known Limitations
+On a healthy restart the log shows `XSetScreenSaver (BLOCKED)` during
+shutdown and the `xset` state is unchanged. Logging is silent by default
+because `XSetInputFocus` / `XSetICFocus` are hot paths.
 
-- If an actual `xscreensaver` instance is running, Deskflow detects its
-  window (`_SCREENSAVER_VERSION`) and talks to it with `SCREENSAVER`
-  `ACTIVATE`/`DEACTIVATE` client messages and synthetic motion events.
-  That path is not blocked by this hook. It is irrelevant for the
-  `xset`-based built-in screen saver this patch targets.
+## Tracer
+
+[tracer/](/tracer/main.go) is a small Go helper that logs `exec` calls and
+their parent, which is how the culprit was identified (nobody runs `xset`;
+Deskflow uses the X11 API directly).
+
+## Limitations
+
+- A real `xscreensaver` instance is controlled via `SCREENSAVER` client
+  messages (detected by `_SCREENSAVER_VERSION`), not via the functions
+  above. That path is not blocked and does not affect the built-in saver
+  this patch targets.
 - The `org.freedesktop.ScreenSaver` / `org.gnome.SessionManager` D-Bus
-  calls in `XDGPowerManager` only inhibit/enable *idle sleep*; they do
-  not blank monitors, so they are intentionally left alone.
-- Functions are matched by name at preload time. A future Deskflow
-  build that statically links X11 or uses symbol versioning would need
-  a different approach.
+  calls in `XDGPowerManager` only inhibit idle sleep and are left alone.
+- Symbols are matched by name at load time; a statically linked X11 or
+  symbol-versioned build would need a different approach.
 
 ## License
 
