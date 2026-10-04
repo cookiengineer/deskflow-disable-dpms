@@ -1,0 +1,3 @@
+x11hook/x11hook.so
+tracer/main
+*.o
